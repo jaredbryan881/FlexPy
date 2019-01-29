@@ -15,11 +15,13 @@ def main():
                         help='Path to txt or csv containing vertical normal stresses')
     parser.add_argument('-ip', '--inParams', type=str, required=False, default=None,
                         help='Path to hdf5 containing curve fit parameters for vertical norm stress.')
+    parser.add_argument('-sx', '--surface', type=str, required=False, nargs=2, default=None,
+                        help='Path to text file containing x-coordinates of the surface from the flow model.')
     args = parser.parse_args()
-    args.inLoad = '/Users/jared/Desktop/URCO/Matlab_Codes/vertNormStress.txt'
 
     # create instance of flexure class
     flex = Flexure()
+
     # get vertical normal stresses
     if args.inLoad is not None:
         # read vertical normal stresses
@@ -29,57 +31,95 @@ def main():
     else:
         raise ValueError("Input file is None. You must specify an input file of stresses or curve fit parameters.")
 
+    # expand dimension if we have only a single timestep
     if lithLoad.ndim == 1:
         lithLoad = np.reshape(lithLoad[1:], (1, lithLoad.shape[0]-1))
     stepmax = lithLoad.shape[0]
 
-    # compute flexure calculate for each time step
-    for tStep in range(stepmax):
-        greenDef = flex.deflectionGreensFunction(flex.x)
-        deflection = flex.convGreenLoad(greenDef, lithLoad[tStep])
-        greenStress = flex.bendingStressGreensFunction(flex.x)
+    if args.surface is not None:
+        surf = flex.readSurface(args.surface)
 
-        sigxx = np.empty((flex.ynum, 2050))
-        for d in range(flex.ynum):
-            sigxx[d] = flex.convGreenLoad(greenStress[d], lithLoad[tStep])
+    dArr = np.linspace(1e+24, 1e+25, 10)
+    error = np.empty((dArr.shape[0], stepmax))
+    for i, d in enumerate(dArr):
+        flex.D = d
+        print('Step {} --- {}'.format(i, d))
+        # compute flexure and bending stress for each time step
+        sigxx = np.empty((stepmax, int(flex.lithH / flex.ystp), flex.xnum))
+        deflection = np.empty((stepmax, flex.xnum))
+        surface = np.empty((stepmax, flex.xnum))
 
-        plt.subplot(2, 1, 1)
-        plt.plot(deflection)
-        plt.title('Deflection (m)')
-        plt.subplot(2, 1, 2)
-        plt.imshow(sigxx, cmap='seismic')
-        plt.title('Bending Stress')
-        #plt.colorbar()
-        plt.clim(-5e+6, 5e+6)
-        plt.show()
+        for tStep in range(stepmax):
+            # define green's functions for deflection and bending stress
+            greenDef = flex.deflectionGreensFunction(flex.x)
+            greenStress = flex.bendingStressGreensFunction(flex.x)
+
+            # compute deflection
+            compDeflection = flex.convGreenLoad(greenDef, lithLoad[tStep])
+            deflection[tStep] = signal.resample(compDeflection, num=flex.xnum)
+
+            # compute bending stress
+            compSigxx = np.empty((flex.ynum, 301))
+            for d in range(flex.ynum):
+                compSigxx[d] = flex.convGreenLoad(greenStress[d], lithLoad[tStep])
+
+            # resample x dimension of computed stress
+            sigxx_dsampx = np.empty((flex.ynum, flex.xnum))
+            sigxx_dsampx = signal.resample(compSigxx, num=flex.xnum, axis=1)
+            # resample y dimension of computed stress
+            sigxx[tStep] = signal.resample(sigxx_dsampx, num=int(flex.lithH/flex.ystp), axis=0)
+
+            # resample surface deflection from flow model
+            surface[tStep] = signal.resample(surf[tStep, 1], flex.xnum)
+
+            error[i, tStep] = flex.rmsError(deflection[tStep], surface[tStep])
+
+    error = np.swapaxes(error, 0, 1)
+    plt.imshow(error, cmap='coolwarm')
+    plt.colorbar()
+    plt.ylabel('Time Step')
+    plt.show()
+
+    tStepBest = np.empty(error.shape[0])
+    tStepBestError = np.empty(error.shape[0])
+    for i in range(tStepBest.shape[0]):
+        tStepBest[i] = np.where(error[i] == np.amin(error[i]))[0]
+        tStepBestError[i] = np.amin(error[i])
+
+    plt.subplot(1, 2, 1)
+    plt.plot(tStepBest)
+    plt.subplot(1, 2, 2)
+    plt.plot(tStepBestError)
+    plt.show()
+
 
 
 class Flexure:
     def __init__(self):
-        """Initialize class for computing deflection and stresses of a sinusoidal load."""
+        """Initialize class for computing deflection and stresses of a discretized or sinusoidal load."""
         # simulation parameters
-        self.xstp = 30000  # m -- x spacing
+        self.xstp = 20000  # m -- x spacing
         self.ystp = 20000  # m -- y spacing
-        self.xnum = 50  # number of nodes in x
+        self.xnum = 101  # number of nodes in x
         self.lithH = 100000  # m -- lithospheric thickness
         self.rhom = 3300  # kg/m**3 -- mantle density
         self.rhoin = 1000  # kg/m**3 -- infill density
         self.g = 9.81  # m/s**2 -- gravitational acceleration
 
         # material properties
-        self.E = 6.5e+10  # Young's modulus (Pa)
-        self.v = 0.25  # Poisson's ratio (dimensionless)
+        self.E = 6.5e+10  # Pa -- Young's modulus
+        self.v = 0.25  # Dimensionless -- Poisson's ratio
         self.I = (self.xstp * self.xnum) * (self.lithH ** 3 / 3)  # m**4 -- second moment of area
-        self.D = (self.E * self.lithH ** 3) / (12 * (1 - self.v ** 2))  # Nm -- flexural rigidity
+        self.D = (self.E * (self.lithH) ** 3) / (12 * (1 - self.v ** 2))  # Nm -- flexural rigidity
         self.alpha = ((4 * self.D) / ((self.rhom - self.rhoin) * self.g))**0.25  # flexural parameter
         self.lamb = 1 / self.alpha  # effective wavelength of the load
 
         # calculation parameters
-        self.lowBound = 0  # m -- lower bound to where we calculate flexure and stress
-        self.upBound = 1000000  # m -- upper bound to where we calculate flexure and stress
-        self.spacing = 1000  # m -- spacing between sampled points
-        self.numPoints = int((self.upBound - self.lowBound) / self.spacing)  # number of points in x
-        self.x = np.linspace(self.lowBound, self.upBound, self.numPoints+1)  # range of points in x
+        self.lowBound = 0  # m -- lower bound in x for where we calculate flexure and stress
+        self.upBound = 2000000  # m -- upper bound in x for where we calculate flexure and stress
+        self.spacing = 20000  # m -- spacing between sampled points
+        self.numPoints = int((self.upBound - self.lowBound) / self.spacing) + 1  # number of points in x
+        self.x = np.linspace(self.lowBound, self.upBound, self.numPoints)  # range of points in x
         self.ynum = 201  # number of points in y
 
     def convGreenLoad(self, green, load):
@@ -156,38 +196,7 @@ class Flexure:
         for i in range(ss_sigmaBend.shape[0]):
             ss_sigmaBend[i] = (M * y[i]) / self.I
 
-        # compute membrane stresses in the simply supported beam
-        ss_sigmaMembrane = 0
-
-        return ss_deflection, ss_sigmaBend, ss_sigmaMembrane
-
-    def cantilevered(self, params, zeros, wavelength, load):
-        """Compute deflection, bending stress, and membrane stress for a cantilevered sinusoidal load.
-        Args:
-            :param params: np.array
-                numpy array containing curve fit parameters
-            :param zeros: np.array
-                numpy array containing coordinates of zero crossings
-            :param wavelength: list
-                list containing wavelength of sinusoid at each time step
-            :param load: np.array
-                numpy array containing vertical normal stresses at the base of the lithosphere
-
-        Returns:
-            :return cl_deflection:
-            :return cl_sigmaBend:
-            :return cl_sigmaMembrane:
-        """
-        cl_mag1 = 0  # maximum stress on left cantilever
-        cl_mag2 = 0  # maximum stress on right cantilever
-
-        cl_len1 = self.xstp * zeros[0]  # length of left cantilever
-        cl_len2 = self.xstp * (self.xnum - zeros[1])  # length of right cantilever
-
-        cl_deflection = 0
-        cl_sigmaBend = 0
-        cl_sigmaMembrane = 0
-        return cl_deflection, cl_sigmaBend, cl_sigmaMembrane
+        return ss_deflection, ss_sigmaBend
 
     def curveFit(self, inFile, saveCurveFit=False):
         """Fit a sinusoid to vertical normal stresses.
@@ -225,20 +234,11 @@ class Flexure:
             params[t], paramsCov = optimize.curve_fit(self.sinusoid, xlin, vertNormStress[t],
                                                       p0=[-2000000, 0.000001, 0, 0])
 
-            # plt.plot(xlin, params[t, 0] * np.sin(params[t, 1]*xlin + params[t, 2]) + params[t, 3])
-            # plt.plot(xlin, vertNormStress[t], '.')
-            # plt.show()
-
             # get two zero crossings
             # assumes single cycle of sinusoid
             zeros[t, 0] = (np.arcsin(-params[t, 3] / params[t, 0]) - params[t, 2]) / params[t, 1]
             midpoint = ((np.pi / 2) - params[t, 2]) / params[t, 1]
             zeros[t, 1] = midpoint + (midpoint - zeros[t, 0])
-
-            print('Timestep {}'.format(t))
-            print('Wavelength: {} km'.format((2 * np.pi / params[t, 1]) * 30))
-            print('Amplitude: {}'.format(params[t, 0]))
-            print('\n')
 
             # record wavelength and time step
             wavelength.append((2 * np.pi / params[t, 1]) * 30000)
@@ -287,21 +287,6 @@ class Flexure:
 
         return params, zeros, wavelength, time, data
 
-    def readStress(self, inFile):
-        """Read vertical normal stresses from a file.
-
-        Params:
-            :param inFile: str
-                string to file containing vertical normal stresses at each timestep
-
-        Returns:
-            :return vertNormStress: np.array
-                numpy array containing vertical normal stresses at each timestep
-        """
-        vertNormStress = np.genfromtxt(inFile, delimiter=',')
-
-        return vertNormStress
-
     def sinusoid(self, x, a, b, c, d):
         """Return a sinusoid with a given amplitude, frequency, phase shift, and vertical shift.
 
@@ -339,6 +324,7 @@ class Flexure:
         for i in range(len(x)):
             xda = x[i] / self.alpha
             wgreen[i] = ((self.alpha**3) / (8 * self.D)) * np.exp(-xda) * (np.cos(xda) + np.sin(xda))
+
         return wgreen
 
     def bendingStressGreensFunction(self, x):
@@ -359,6 +345,79 @@ class Flexure:
             sgreen[i] = (-self.E * self.lamb**3) / ((1 - self.v**2) * (self.rhom - self.rhoin) * self.g) * \
                        np.exp(-self.lamb * x[:]) * (np.cos(self.lamb * x[:]) - np.sin(self.lamb * x[:])) * y[i]
         return sgreen
+
+    def readSurface(self, surface):
+        """Read the x and y coordinates of the surface of the lithosphere from the flow model.
+
+        Parameters:
+            :param surface: list
+                path to the files containing x and y coordinates of the surface of the lithosphere.
+
+        Returns:
+            :return surf: np.array
+                numpy array containing x and zeroed y coordinates of the surface of the lithosphere.
+        """
+        surfX = np.genfromtxt(surface[0], delimiter=',')
+        surfY = np.genfromtxt(surface[1], delimiter=',')
+
+        surf = np.empty((surfX.shape[0], 2, surfX.shape[1]))
+        surf[:, 0] = surfX
+        surf[:, 1] = self.zeroSurface(surfY)
+
+        return surf
+
+    def readStress(self, inFile):
+        """Read vertical normal stresses from a file.
+
+        Params:
+            :param inFile: str
+                string to file containing vertical normal stresses at each timestep
+
+        Returns:
+            :return vertNormStress: np.array
+                numpy array containing vertical normal stresses at each timestep
+        """
+        fType = inFile[-3:]
+        if fType == 'txt':
+            vertNormStress = -np.genfromtxt(inFile, delimiter=',')
+        else:
+            hf = h5py.File(inFile)
+            vertNormStress = -hf['sigmayy'][:, int(self.lithH / self.ystp)]
+            hf.close()
+
+        return vertNormStress
+
+    def zeroSurface(self, yCoords):
+        """Convert depth of lithospheric markers to relative changes in depths.
+
+        Parameters:
+            :param yCoords: np.array
+                numpy array containing y coordinates of the surface deflection profile.
+
+        Returns:
+            :return zeroSurface: np.array
+                numpy array containing relative movements of the surface of the lithosphere.
+        """
+        zeroSurface = np.array(yCoords.shape)
+        # subtract original depth to give relative change
+        zeroSurface = yCoords - yCoords[0]
+
+        return zeroSurface
+
+    def rmsError(self, curve_1, curve_2):
+        """Compute the rms error between two curves.
+
+        Parameters:
+            :param curve_1: np.array
+                numpy array containing deflection values
+            :param curve_2: np.array
+                numpy array containing deflection values
+
+        Returns:
+            :return error: float
+                float containing rms error between the two curves.
+        """
+        return np.sqrt(np.sum((curve_1-curve_2)**2))
 
 
 if __name__ == '__main__':
